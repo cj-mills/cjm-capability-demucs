@@ -21,6 +21,9 @@ from cjm_media_plugin_system.core import MediaMetadata
 from cjm_media_plugin_system.storage import MediaProcessingStorage
 
 from cjm_plugin_system.utils.hashing import hash_file
+from cjm_plugin_system.core.errors import (
+    PluginInputError, PluginResourceError, ResourceShortfall,
+)
 from cjm_plugin_system.utils.validation import (
     dict_to_config, config_to_dict, dataclass_to_jsonschema,
     SCHEMA_TITLE, SCHEMA_DESC, SCHEMA_ENUM, SCHEMA_MIN, SCHEMA_MAX
@@ -239,7 +242,10 @@ class DemucsProcessingPlugin(MediaProcessingPlugin):
         elif action == "separate_vocals":
             return self._separate_vocals(**kwargs)
         else:
-            raise ValueError(f"Unknown action: {action}. Supported: 'get_info', 'separate_vocals'")
+            raise PluginInputError(  # SG-47: typed input-validation
+                f"Unknown action: {action}. Supported: 'get_info', 'separate_vocals'",
+                fields_invalid=["action"],
+            )
     
     # ── Interface Methods (not applicable) ───────────────────────────
     
@@ -263,13 +269,21 @@ class DemucsProcessingPlugin(MediaProcessingPlugin):
     
     def convert(self, input_path, output_format, **kwargs):
         """Not applicable for source separation."""
-        raise ValueError("convert is not supported by the Demucs plugin. "
-                         "Use 'separate_vocals' instead.")
+        raise PluginInputError(  # SG-47: typed input-validation; this method is
+            # not applicable for this plugin domain.
+            "convert is not supported by the Demucs plugin. "
+            "Use 'separate_vocals' instead.",
+            fields_invalid=["action"],
+        )
     
     def extract_segment(self, input_path, start, end, output_path=None):
         """Not applicable for source separation."""
-        raise ValueError("extract_segment is not supported by the Demucs plugin. "
-                         "Use 'separate_vocals' instead.")
+        raise PluginInputError(  # SG-47: typed input-validation; this method is
+            # not applicable for this plugin domain.
+            "extract_segment is not supported by the Demucs plugin. "
+            "Use 'separate_vocals' instead.",
+            fields_invalid=["action"],
+        )
     
     # ── Core Action ──────────────────────────────────────────────────
     
@@ -293,9 +307,22 @@ class DemucsProcessingPlugin(MediaProcessingPlugin):
         self.report_progress(0.0, "Loading model...")
         self._load_model()
         
-        # Run separation
+        # Run separation. SG-47 Track B wraps the inference site so CUDA OOM
+        # surfaces as PluginResourceError → CR-7 reactive-retry reloads.
         self.report_progress(0.1, "Separating audio...")
-        origin, separated = self._separator.separate_audio_file(input_p)
+        try:
+            origin, separated = self._separator.separate_audio_file(input_p)
+        except torch.cuda.OutOfMemoryError as e:
+            free_bytes = torch.cuda.mem_get_info()[0] if torch.cuda.is_available() else 0
+            available_mb = free_bytes / (1024 ** 2)
+            raise PluginResourceError(
+                f"CUDA OOM during Demucs separation (model={self.config.model!r}): {e}",
+                resource_shortfall=ResourceShortfall(
+                    resource='gpu_vram_mb',
+                    needed=available_mb + 100.0,
+                    available=available_mb,
+                ),
+            ) from e
         
         # Save vocals
         self.report_progress(0.8, "Saving vocals...")
