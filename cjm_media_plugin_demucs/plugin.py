@@ -21,6 +21,7 @@ from cjm_media_plugin_system.core import MediaMetadata
 from cjm_media_plugin_system.storage import MediaProcessingStorage
 
 from cjm_plugin_system.utils.hashing import hash_file
+from cjm_plugin_system.core.interface import RELOAD_TRIGGER
 from cjm_plugin_system.core.errors import (
     PluginInputError, PluginResourceError, ResourceShortfall,
 )
@@ -38,6 +39,7 @@ class DemucsPluginConfig:
         default="htdemucs",
         metadata={
             SCHEMA_TITLE: "Model",
+            RELOAD_TRIGGER: "model",  # CR-4: change triggers model reload
             SCHEMA_DESC: "Demucs model to use for separation.",
             SCHEMA_ENUM: ["htdemucs", "htdemucs_ft", "htdemucs_6s", "mdx_extra", "mdx_extra_q"]
         }
@@ -47,6 +49,7 @@ class DemucsPluginConfig:
         default="auto",
         metadata={
             SCHEMA_TITLE: "Device",
+            RELOAD_TRIGGER: "model",  # CR-4: change triggers model reload
             SCHEMA_DESC: "Compute device. 'auto' selects CUDA if available.",
             SCHEMA_ENUM: ["auto", "cpu", "cuda"]
         }
@@ -147,7 +150,7 @@ class DemucsProcessingPlugin(MediaProcessingPlugin):
     
     def cleanup(self) -> None:
         """Clean up plugin resources."""
-        self._unload_model()
+        self._release_model()
         self.logger.info("Plugin cleaned up")
     
     def is_available(self) -> bool:  # Whether the plugin can run
@@ -179,7 +182,7 @@ class DemucsProcessingPlugin(MediaProcessingPlugin):
         # Different model requested — unload first
         if self._separator is not None:
             self.logger.info(f"Switching model: {self._loaded_model_name} -> {model_name}")
-            self._unload_model()
+            self._release_model()
         
         device = self.config.device
         if device == "auto":
@@ -197,7 +200,7 @@ class DemucsProcessingPlugin(MediaProcessingPlugin):
         self._loaded_model_name = model_name
         self.logger.info(f"Model loaded: samplerate={self._separator.samplerate}")
     
-    def _unload_model(self) -> None:
+    def _release_model(self) -> None:
         """Unload the Demucs model and free GPU memory."""
         if self._separator is not None:
             del self._separator
