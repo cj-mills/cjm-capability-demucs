@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, ClassVar
 
 import torch
+from fastcore.basics import patch
 
 from cjm_media_plugin_system.processing_interface import MediaProcessingPlugin
 from cjm_media_plugin_system.core import MediaMetadata
@@ -154,14 +155,6 @@ class DemucsProcessingPlugin(MediaProcessingPlugin):
     
     # ── Lifecycle ────────────────────────────────────────────────────
     
-    def _apply_config(self,
-                      config: Optional[Any] = None,  # Configuration dict or None for defaults
-                     ) -> None:
-        """CR-4: apply config values only. Called by initialize (first-time) and the
-        substrate's reconfigure delta path. Model release on a model/device change is
-        handled declaratively via RELOAD_TRIGGER -> _release_model (device resolved
-        lazily in _load_model)."""
-        self.config = dict_to_config(DemucsPluginConfig, config or {})
 
     def initialize(self,
                    config: Optional[Any] = None,  # Configuration dict or None for defaults
@@ -180,28 +173,9 @@ class DemucsProcessingPlugin(MediaProcessingPlugin):
         self.logger.info(f"Initialized with model={self.config.model}, "
                          f"device={self.config.device}")
     
-    def prefetch(self) -> None:
-        """CR-4 (SG-19): eagerly load the model so the first execute() doesn't pay
-        the download/load cost. Idempotent via _load_model's None-guard."""
-        self._load_model()
 
-    def on_disable(self) -> None:
-        """CR-2: release the GPU model when the operator disables the plugin (the
-        worker stays alive); lazy reload on the next execute after re-enable."""
-        self._release_model()
 
-    def cleanup(self) -> None:
-        """Clean up plugin resources."""
-        self._release_model()
-        self.logger.info("Plugin cleaned up")
     
-    def is_available(self) -> bool:  # Whether the plugin can run
-        """Check if the plugin is available on this system."""
-        try:
-            import demucs  # noqa
-            return True
-        except ImportError:
-            return False
     
     def get_config_schema(self) -> Dict[str, Any]:  # JSON Schema for UI forms
         """Return JSON Schema for the plugin configuration."""
@@ -213,59 +187,10 @@ class DemucsProcessingPlugin(MediaProcessingPlugin):
     
     # ── Model Management ────────────────────────────────────────────
     
-    def _load_model(self) -> None:
-        """Load the Demucs Separator (lazy, cached).
-
-        CR-4: a model/device change releases the separator declaratively via
-        RELOAD_TRIGGER -> _release_model, so no manual change-detection is needed here —
-        a None separator means a (re)load is required. The heartbeat wraps the WHOLE
-        load: Separator() downloads weights via torch.hub on a cold cache (silent to the
-        substrate's stall detector), so the heartbeat keeps the (progress, message)
-        tuple advancing to avoid a false-positive stall."""
-        if self._separator is not None:
-            return
-        
-        device = resolve_torch_device(self.config.device)
-        self.logger.info(f"Loading Demucs model '{self.config.model}' on {device}...")
-        from demucs.api import Separator
-        with self.heartbeat("loading Demucs model"):
-            self._separator = Separator(
-                model=self.config.model,
-                device=device,
-                shifts=self.config.shifts,
-                overlap=self.config.overlap,
-                segment=self.config.segment,
-            )
-        self.logger.info(f"Model loaded: samplerate={self._separator.samplerate}")
     
-    def _release_model(self) -> None:
-        """CR-4: release the Demucs Separator + free CUDA cache. RELOAD_TRIGGER target
-        for model/device; on_disable / cleanup delegate here. Idempotent via
-        cjm-torch-plugin-utils' release_model (no-op when already released)."""
-        release_model(self, ["_separator"], device="cuda", logger=self.logger)
     
     # ── Job Storage ──────────────────────────────────────────────────
     
-    def _store_job(self,
-                   action: str,  # Action name
-                   input_path: str,  # Source file path
-                   output_path: str,  # Output file path
-                   parameters: Optional[Dict[str, Any]] = None,  # Action parameters
-                   metadata: Optional[Dict[str, Any]] = None,  # Additional metadata
-                   input_hash: Optional[str] = None,  # Pre-computed input hash
-                  ) -> str:  # Generated job_id
-        """Hash input/output files and store a processing job record."""
-        job_id = str(uuid.uuid4())
-        if input_hash is None:
-            input_hash = hash_file(input_path)
-        output_hash = hash_file(output_path)
-        self.storage.save(
-            job_id=job_id, action=action,
-            input_path=input_path, input_hash=input_hash,
-            output_path=output_path, output_hash=output_hash,
-            parameters=parameters, metadata=metadata
-        )
-        return job_id
     
     # ── Action Dispatch ──────────────────────────────────────────────
     
@@ -282,15 +207,7 @@ class DemucsProcessingPlugin(MediaProcessingPlugin):
             f"Unknown action: {action}", fields_invalid=["action"],
         )
 
-    @plugin_action("get_info")
-    def _action_get_info(self, **kwargs) -> Dict[str, Any]:
-        """Action wrapper -> get_info()."""
-        return self.get_info(kwargs["file_path"]).to_dict()
 
-    @plugin_action("separate_vocals")
-    def _action_separate_vocals(self, **kwargs) -> Dict[str, Any]:
-        """Action wrapper -> _separate_vocals()."""
-        return self._separate_vocals(**kwargs)
     
     # ── Interface Methods (not applicable) ───────────────────────────
     
@@ -331,90 +248,206 @@ class DemucsProcessingPlugin(MediaProcessingPlugin):
         )
     
     # ── Core Action ──────────────────────────────────────────────────
-    
-    def _separate_vocals(self,
-                         input_path: str,  # Path to audio file
-                         output_dir: Optional[str] = None,  # Output directory (default: content+config cache dir)
-                         output_format: Optional[str] = None,  # Output format override
-                        ) -> Dict[str, Any]:  # Separation result
-        """Extract vocals stem from an audio file."""
-        fmt = output_format or self.config.output_format
-        input_p = Path(input_path)
-        
-        # Determine output directory. Q3 Layer B: a content+config-addressed cache dir
-        # (<data_dir>/separate_vocals/<stem>/<input6>_<config12>/) so a re-run with a
-        # different model/format lands in a DISTINCT dir instead of overwriting — and a
-        # chained upstream change invalidates this key automatically.
-        if output_dir is None:
-            out_dir = cache_dir_for_config(
-                self._data_dir, input_path, "separate_vocals", config_to_dict(self.config),
-            )
-        else:
-            out_dir = Path(output_dir)
-            out_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Load model (lazy, cached)
-        self.report_progress(0.0, "Loading model...")
-        self._load_model()
-        
-        # Run separation. SG-47 Track B wraps the inference site so CUDA OOM surfaces as
-        # PluginResourceError (via cjm-torch-plugin-utils) → CR-7 reactive-retry reloads.
-        self.report_progress(0.1, "Separating audio...")
-        try:
-            origin, separated = self._separator.separate_audio_file(input_p)
-        except torch.cuda.OutOfMemoryError as e:
-            raise cuda_oom_to_plugin_resource_error(
-                e, label=f"during Demucs separation (model={self.config.model!r})",
-            ) from e
-        
-        # Save vocals
-        self.report_progress(0.8, "Saving vocals...")
-        from demucs.audio import save_audio
-        vocals_path = out_dir / f"vocals.{fmt}"
-        save_audio(separated["vocals"], str(vocals_path),
-                   samplerate=self._separator.samplerate)
-        
-        # Optionally save other stems
-        other_stems_saved = []
-        if self.config.save_other_stems:
-            for stem_name, stem_tensor in separated.items():
-                if stem_name == "vocals":
-                    continue
-                stem_path = out_dir / f"{stem_name}.{fmt}"
-                save_audio(stem_tensor, str(stem_path),
-                           samplerate=self._separator.samplerate)
-                other_stems_saved.append(str(stem_path))
-        
-        # Hash and store job
-        self.report_progress(0.9, "Storing job record...")
-        job_id = self._store_job(
-            action="separate_vocals",
-            input_path=str(input_p),
-            output_path=str(vocals_path),
-            parameters={
-                "model": self.config.model,
-                "output_format": fmt,
-                "shifts": self.config.shifts,
-                "overlap": self.config.overlap,
-            },
-            metadata={
-                "duration": float(separated["vocals"].shape[-1]) / self._separator.samplerate,
-                "stems": list(separated.keys()),
-                "device": str(self.config.device),
-                "other_stems_saved": other_stems_saved,
-            },
+
+# %% ../nbs/plugin.ipynb #m-apply-config
+@patch
+def _apply_config(self:DemucsProcessingPlugin,
+                  config: Optional[Any] = None,  # Configuration dict or None for defaults
+                 ) -> None:
+    """CR-4: apply config values only. Called by initialize (first-time) and the
+    substrate's reconfigure delta path. Model release on a model/device change is
+    handled declaratively via RELOAD_TRIGGER -> _release_model (device resolved
+    lazily in _load_model)."""
+    self.config = dict_to_config(DemucsPluginConfig, config or {})
+
+# %% ../nbs/plugin.ipynb #m-prefetch
+@patch
+def prefetch(self:DemucsProcessingPlugin) -> None:
+    """CR-4 (SG-19): eagerly load the model so the first execute() doesn't pay
+    the download/load cost. Idempotent via _load_model's None-guard."""
+    self._load_model()
+
+# %% ../nbs/plugin.ipynb #m-on-disable
+@patch
+def on_disable(self:DemucsProcessingPlugin) -> None:
+    """CR-2: release the GPU model when the operator disables the plugin (the
+    worker stays alive); lazy reload on the next execute after re-enable."""
+    self._release_model()
+
+# %% ../nbs/plugin.ipynb #m-cleanup
+@patch
+def cleanup(self:DemucsProcessingPlugin) -> None:
+    """Clean up plugin resources."""
+    self._release_model()
+    self.logger.info("Plugin cleaned up")
+
+# %% ../nbs/plugin.ipynb #m-is-available
+@patch
+def is_available(self:DemucsProcessingPlugin) -> bool:  # Whether the plugin can run
+    """Check if the plugin is available on this system."""
+    try:
+        import demucs  # noqa
+        return True
+    except ImportError:
+        return False
+
+# %% ../nbs/plugin.ipynb #m-load-model
+@patch
+def _load_model(self:DemucsProcessingPlugin) -> None:
+    """Load the Demucs Separator (lazy, cached).
+
+    CR-4: a model/device change releases the separator declaratively via
+    RELOAD_TRIGGER -> _release_model, so no manual change-detection is needed here —
+    a None separator means a (re)load is required. The heartbeat wraps the WHOLE
+    load: Separator() downloads weights via torch.hub on a cold cache (silent to the
+    substrate's stall detector), so the heartbeat keeps the (progress, message)
+    tuple advancing to avoid a false-positive stall."""
+    if self._separator is not None:
+        return
+
+    device = resolve_torch_device(self.config.device)
+    self.logger.info(f"Loading Demucs model '{self.config.model}' on {device}...")
+    from demucs.api import Separator
+    with self.heartbeat("loading Demucs model"):
+        self._separator = Separator(
+            model=self.config.model,
+            device=device,
+            shifts=self.config.shifts,
+            overlap=self.config.overlap,
+            segment=self.config.segment,
         )
-        
-        self.report_progress(1.0, "Complete")
-        
-        return {
-            "job_id": job_id,
-            "output_path": str(vocals_path),
-            "input_path": str(input_p),
-            "duration": float(separated["vocals"].shape[-1]) / self._separator.samplerate,
+    self.logger.info(f"Model loaded: samplerate={self._separator.samplerate}")
+
+# %% ../nbs/plugin.ipynb #m-release-model
+@patch
+def _release_model(self:DemucsProcessingPlugin) -> None:
+    """CR-4: release the Demucs Separator + free CUDA cache. RELOAD_TRIGGER target
+    for model/device; on_disable / cleanup delegate here. Idempotent via
+    cjm-torch-plugin-utils' release_model (no-op when already released)."""
+    release_model(self, ["_separator"], device="cuda", logger=self.logger)
+
+# %% ../nbs/plugin.ipynb #m-store-job
+@patch
+def _store_job(self:DemucsProcessingPlugin,
+               action: str,  # Action name
+               input_path: str,  # Source file path
+               output_path: str,  # Output file path
+               parameters: Optional[Dict[str, Any]] = None,  # Action parameters
+               metadata: Optional[Dict[str, Any]] = None,  # Additional metadata
+               input_hash: Optional[str] = None,  # Pre-computed input hash
+              ) -> str:  # Generated job_id
+    """Hash input/output files and store a processing job record."""
+    job_id = str(uuid.uuid4())
+    if input_hash is None:
+        input_hash = hash_file(input_path)
+    output_hash = hash_file(output_path)
+    self.storage.save(
+        job_id=job_id, action=action,
+        input_path=input_path, input_hash=input_hash,
+        output_path=output_path, output_hash=output_hash,
+        parameters=parameters, metadata=metadata
+    )
+    return job_id
+
+# %% ../nbs/plugin.ipynb #m-action-get-info
+@patch
+@plugin_action("get_info")
+def _action_get_info(self:DemucsProcessingPlugin, **kwargs) -> Dict[str, Any]:
+    """Action wrapper -> get_info()."""
+    return self.get_info(kwargs["file_path"]).to_dict()
+
+# %% ../nbs/plugin.ipynb #m-action-separate-vocals
+@patch
+@plugin_action("separate_vocals")
+def _action_separate_vocals(self:DemucsProcessingPlugin, **kwargs) -> Dict[str, Any]:
+    """Action wrapper -> _separate_vocals()."""
+    return self._separate_vocals(**kwargs)
+
+# %% ../nbs/plugin.ipynb #m-separate-vocals
+@patch
+def _separate_vocals(self:DemucsProcessingPlugin,
+                     input_path: str,  # Path to audio file
+                     output_dir: Optional[str] = None,  # Output directory (default: content+config cache dir)
+                     output_format: Optional[str] = None,  # Output format override
+                    ) -> Dict[str, Any]:  # Separation result
+    """Extract vocals stem from an audio file."""
+    fmt = output_format or self.config.output_format
+    input_p = Path(input_path)
+
+    # Determine output directory. Q3 Layer B: a content+config-addressed cache dir
+    # (<data_dir>/separate_vocals/<stem>/<input6>_<config12>/) so a re-run with a
+    # different model/format lands in a DISTINCT dir instead of overwriting — and a
+    # chained upstream change invalidates this key automatically.
+    if output_dir is None:
+        out_dir = cache_dir_for_config(
+            self._data_dir, input_path, "separate_vocals", config_to_dict(self.config),
+        )
+    else:
+        out_dir = Path(output_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Load model (lazy, cached)
+    self.report_progress(0.0, "Loading model...")
+    self._load_model()
+
+    # Run separation. SG-47 Track B wraps the inference site so CUDA OOM surfaces as
+    # PluginResourceError (via cjm-torch-plugin-utils) → CR-7 reactive-retry reloads.
+    self.report_progress(0.1, "Separating audio...")
+    try:
+        origin, separated = self._separator.separate_audio_file(input_p)
+    except torch.cuda.OutOfMemoryError as e:
+        raise cuda_oom_to_plugin_resource_error(
+            e, label=f"during Demucs separation (model={self.config.model!r})",
+        ) from e
+
+    # Save vocals
+    self.report_progress(0.8, "Saving vocals...")
+    from demucs.audio import save_audio
+    vocals_path = out_dir / f"vocals.{fmt}"
+    save_audio(separated["vocals"], str(vocals_path),
+               samplerate=self._separator.samplerate)
+
+    # Optionally save other stems
+    other_stems_saved = []
+    if self.config.save_other_stems:
+        for stem_name, stem_tensor in separated.items():
+            if stem_name == "vocals":
+                continue
+            stem_path = out_dir / f"{stem_name}.{fmt}"
+            save_audio(stem_tensor, str(stem_path),
+                       samplerate=self._separator.samplerate)
+            other_stems_saved.append(str(stem_path))
+
+    # Hash and store job
+    self.report_progress(0.9, "Storing job record...")
+    job_id = self._store_job(
+        action="separate_vocals",
+        input_path=str(input_p),
+        output_path=str(vocals_path),
+        parameters={
             "model": self.config.model,
-            "stems_available": list(separated.keys()),
-        }
+            "output_format": fmt,
+            "shifts": self.config.shifts,
+            "overlap": self.config.overlap,
+        },
+        metadata={
+            "duration": float(separated["vocals"].shape[-1]) / self._separator.samplerate,
+            "stems": list(separated.keys()),
+            "device": str(self.config.device),
+            "other_stems_saved": other_stems_saved,
+        },
+    )
 
+    self.report_progress(1.0, "Complete")
 
+    return {
+        "job_id": job_id,
+        "output_path": str(vocals_path),
+        "input_path": str(input_p),
+        "duration": float(separated["vocals"].shape[-1]) / self._separator.samplerate,
+        "model": self.config.model,
+        "stems_available": list(separated.keys()),
+    }
+
+# %% ../nbs/plugin.ipynb #plugin-class-tail
 DemucsProcessingPlugin.supported_actions = collect_plugin_actions(DemucsProcessingPlugin)
