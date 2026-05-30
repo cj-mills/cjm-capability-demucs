@@ -21,6 +21,9 @@ dependencies:
     - cjm-plugin-system
     - cjm-media-plugin-system
 
+    # Shared torch helpers for plugins (release_model / cuda_oom / resolve_device)
+    - cjm-torch-plugin-utils
+
     # Demucs fork (inference-only, TorchCodec)
     - cjm-demucs-v4
 

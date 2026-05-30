@@ -12,7 +12,7 @@ import logging
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, ClassVar
 
 import torch
 
@@ -21,14 +21,18 @@ from cjm_media_plugin_system.core import MediaMetadata
 from cjm_media_plugin_system.storage import MediaProcessingStorage
 
 from cjm_plugin_system.utils.hashing import hash_file
-from cjm_plugin_system.core.interface import RELOAD_TRIGGER, plugin_action, collect_plugin_actions
-from cjm_plugin_system.core.errors import (
-    PluginInputError, PluginResourceError, ResourceShortfall,
-)
+from cjm_plugin_system.utils.cache_paths import cache_dir_for_config
+from cjm_plugin_system.core.interface import RELOAD_TRIGGER, plugin_action, collect_plugin_actions, EnvVarSpec
+from cjm_plugin_system.core.errors import PluginInputError
 from cjm_plugin_system.utils.validation import (
     dict_to_config, config_to_dict, dataclass_to_jsonschema,
     SCHEMA_TITLE, SCHEMA_DESC, SCHEMA_ENUM, SCHEMA_MIN, SCHEMA_MAX
 )
+
+# Shared torch helpers (cjm-torch-plugin-utils): release + CUDA-OOM typing + device resolution.
+from cjm_torch_plugin_utils.memory import release_model
+from cjm_torch_plugin_utils.oom import cuda_oom_to_plugin_resource_error
+from cjm_torch_plugin_utils.device import resolve_torch_device
 
 # %% ../nbs/plugin.ipynb #config-dataclass
 @dataclass
@@ -103,6 +107,24 @@ class DemucsProcessingPlugin(MediaProcessingPlugin):
     """Demucs v4 source separation plugin for vocals extraction."""
     
     config_class = DemucsPluginConfig
+
+    # Track 19 (CR-12 worker-env model): worker spawn env declared on the class.
+    # CUDA_VISIBLE_DEVICES is static; TORCH_HOME is templated to the substrate models
+    # dir (Demucs downloads weights via torch.hub). The substrate injects at Popen.
+    WORKER_ENV: ClassVar[List[EnvVarSpec]] = [
+        EnvVarSpec(
+            name="CUDA_VISIBLE_DEVICES",
+            default="0",
+            label="GPU Device",
+            description="Which GPU index the worker uses.",
+        ),
+        EnvVarSpec(
+            name="TORCH_HOME",
+            default="${CJM_MODELS_DIR}/torch",
+            label="Torch Hub Cache",
+            description="torch.hub cache root for Demucs model downloads (templated to the substrate models dir).",
+        ),
+    ]
     
     def __init__(self):
         """Initialize the plugin."""
@@ -111,7 +133,6 @@ class DemucsProcessingPlugin(MediaProcessingPlugin):
         self.storage: Optional[MediaProcessingStorage] = None
         self._data_dir: Optional[str] = None
         self._separator = None  # Lazy-loaded Demucs Separator
-        self._loaded_model_name: Optional[str] = None  # Track which model is loaded
     
     # ── Properties ──────────────────────────────────────────────────
     
@@ -193,43 +214,35 @@ class DemucsProcessingPlugin(MediaProcessingPlugin):
     # ── Model Management ────────────────────────────────────────────
     
     def _load_model(self) -> None:
-        """Load or reload the Demucs Separator (lazy, cached)."""
-        model_name = self.config.model
-        
-        # Already loaded with the same model
-        if self._separator is not None and self._loaded_model_name == model_name:
+        """Load the Demucs Separator (lazy, cached).
+
+        CR-4: a model/device change releases the separator declaratively via
+        RELOAD_TRIGGER -> _release_model, so no manual change-detection is needed here —
+        a None separator means a (re)load is required. The heartbeat wraps the WHOLE
+        load: Separator() downloads weights via torch.hub on a cold cache (silent to the
+        substrate's stall detector), so the heartbeat keeps the (progress, message)
+        tuple advancing to avoid a false-positive stall."""
+        if self._separator is not None:
             return
         
-        # Different model requested — unload first
-        if self._separator is not None:
-            self.logger.info(f"Switching model: {self._loaded_model_name} -> {model_name}")
-            self._release_model()
-        
-        device = self.config.device
-        if device == "auto":
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-        
-        self.logger.info(f"Loading Demucs model '{model_name}' on {device}...")
+        device = resolve_torch_device(self.config.device)
+        self.logger.info(f"Loading Demucs model '{self.config.model}' on {device}...")
         from demucs.api import Separator
-        self._separator = Separator(
-            model=model_name,
-            device=device,
-            shifts=self.config.shifts,
-            overlap=self.config.overlap,
-            segment=self.config.segment,
-        )
-        self._loaded_model_name = model_name
+        with self.heartbeat("loading Demucs model"):
+            self._separator = Separator(
+                model=self.config.model,
+                device=device,
+                shifts=self.config.shifts,
+                overlap=self.config.overlap,
+                segment=self.config.segment,
+            )
         self.logger.info(f"Model loaded: samplerate={self._separator.samplerate}")
     
     def _release_model(self) -> None:
-        """Unload the Demucs model and free GPU memory."""
-        if self._separator is not None:
-            del self._separator
-            self._separator = None
-            self._loaded_model_name = None
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            self.logger.info("Model unloaded, CUDA cache cleared")
+        """CR-4: release the Demucs Separator + free CUDA cache. RELOAD_TRIGGER target
+        for model/device; on_disable / cleanup delegate here. Idempotent via
+        cjm-torch-plugin-utils' release_model (no-op when already released)."""
+        release_model(self, ["_separator"], device="cuda", logger=self.logger)
     
     # ── Job Storage ──────────────────────────────────────────────────
     
@@ -321,39 +334,37 @@ class DemucsProcessingPlugin(MediaProcessingPlugin):
     
     def _separate_vocals(self,
                          input_path: str,  # Path to audio file
-                         output_dir: Optional[str] = None,  # Output directory (default: data_dir/vocals/)
+                         output_dir: Optional[str] = None,  # Output directory (default: content+config cache dir)
                          output_format: Optional[str] = None,  # Output format override
                         ) -> Dict[str, Any]:  # Separation result
         """Extract vocals stem from an audio file."""
         fmt = output_format or self.config.output_format
         input_p = Path(input_path)
         
-        # Determine output directory
+        # Determine output directory. Q3 Layer B: a content+config-addressed cache dir
+        # (<data_dir>/separate_vocals/<stem>/<input6>_<config12>/) so a re-run with a
+        # different model/format lands in a DISTINCT dir instead of overwriting — and a
+        # chained upstream change invalidates this key automatically.
         if output_dir is None:
-            out_dir = Path(self._data_dir) / "vocals" / input_p.stem
+            out_dir = cache_dir_for_config(
+                self._data_dir, input_path, "separate_vocals", config_to_dict(self.config),
+            )
         else:
             out_dir = Path(output_dir)
-        out_dir.mkdir(parents=True, exist_ok=True)
+            out_dir.mkdir(parents=True, exist_ok=True)
         
         # Load model (lazy, cached)
         self.report_progress(0.0, "Loading model...")
         self._load_model()
         
-        # Run separation. SG-47 Track B wraps the inference site so CUDA OOM
-        # surfaces as PluginResourceError → CR-7 reactive-retry reloads.
+        # Run separation. SG-47 Track B wraps the inference site so CUDA OOM surfaces as
+        # PluginResourceError (via cjm-torch-plugin-utils) → CR-7 reactive-retry reloads.
         self.report_progress(0.1, "Separating audio...")
         try:
             origin, separated = self._separator.separate_audio_file(input_p)
         except torch.cuda.OutOfMemoryError as e:
-            free_bytes = torch.cuda.mem_get_info()[0] if torch.cuda.is_available() else 0
-            available_mb = free_bytes / (1024 ** 2)
-            raise PluginResourceError(
-                f"CUDA OOM during Demucs separation (model={self.config.model!r}): {e}",
-                resource_shortfall=ResourceShortfall(
-                    resource='gpu_vram_mb',
-                    needed=available_mb + 100.0,
-                    available=available_mb,
-                ),
+            raise cuda_oom_to_plugin_resource_error(
+                e, label=f"during Demucs separation (model={self.config.model!r})",
             ) from e
         
         # Save vocals
@@ -407,4 +418,3 @@ class DemucsProcessingPlugin(MediaProcessingPlugin):
 
 
 DemucsProcessingPlugin.supported_actions = collect_plugin_actions(DemucsProcessingPlugin)
-
