@@ -21,7 +21,7 @@ from cjm_media_plugin_system.processing_interface import MediaProcessingPlugin
 from cjm_media_plugin_system.core import MediaMetadata
 from cjm_media_plugin_system.storage import MediaProcessingStorage
 
-from cjm_plugin_system.utils.hashing import hash_file
+from cjm_plugin_system.utils.hashing import hash_file, hash_dict_canonical
 from cjm_plugin_system.utils.cache_paths import cache_dir_for_config
 from cjm_plugin_system.core.interface import RELOAD_TRIGGER, plugin_action, collect_plugin_actions, EnvVarSpec
 from cjm_plugin_system.core.errors import PluginInputError
@@ -209,7 +209,7 @@ class DemucsProcessingPlugin(MediaProcessingPlugin):
 
 
     
-    # ── Interface Methods (not applicable) ───────────────────────────
+    # ── Interface Methods ───────────────────────────
     
     def get_info(self,
                  file_path: str,  # Path to audio file
@@ -228,25 +228,7 @@ class DemucsProcessingPlugin(MediaProcessingPlugin):
             }],
             video_streams=[],
         )
-    
-    def convert(self, input_path, output_format, **kwargs):
-        """Not applicable for source separation."""
-        raise PluginInputError(  # SG-47: typed input-validation; this method is
-            # not applicable for this plugin domain.
-            "convert is not supported by the Demucs plugin. "
-            "Use 'separate_vocals' instead.",
-            fields_invalid=["action"],
-        )
-    
-    def extract_segment(self, input_path, start, end, output_path=None):
-        """Not applicable for source separation."""
-        raise PluginInputError(  # SG-47: typed input-validation; this method is
-            # not applicable for this plugin domain.
-            "extract_segment is not supported by the Demucs plugin. "
-            "Use 'separate_vocals' instead.",
-            fields_invalid=["action"],
-        )
-    
+        
     # ── Core Action ──────────────────────────────────────────────────
 
 # %% ../nbs/plugin.ipynb #m-apply-config
@@ -335,17 +317,19 @@ def _store_job(self:DemucsProcessingPlugin,
                parameters: Optional[Dict[str, Any]] = None,  # Action parameters
                metadata: Optional[Dict[str, Any]] = None,  # Additional metadata
                input_hash: Optional[str] = None,  # Pre-computed input hash
+               config_hash: str = "",  # Cache key over the action's parameters
               ) -> str:  # Generated job_id
-    """Hash input/output files and store a processing job record."""
+    """Hash input/output files and store a processing job record (upsert by
+    action + input_path + config_hash; logs + swallows save failures)."""
     job_id = str(uuid.uuid4())
     if input_hash is None:
         input_hash = hash_file(input_path)
     output_hash = hash_file(output_path)
-    self.storage.save(
+    self.storage.save_with_logging(
         job_id=job_id, action=action,
-        input_path=input_path, input_hash=input_hash,
+        input_path=input_path, input_hash=input_hash, config_hash=config_hash,
         output_path=output_path, output_hash=output_hash,
-        parameters=parameters, metadata=metadata
+        parameters=parameters, metadata=metadata, logger=self.logger,
     )
     return job_id
 
@@ -385,6 +369,19 @@ def _separate_vocals(self:DemucsProcessingPlugin,
     else:
         out_dir = Path(output_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Layer C: skip the (GPU) separation if this (input, config) result is cached.
+    input_hash = hash_file(input_path)
+    config_hash = hash_dict_canonical(config_to_dict(self.config))
+    cached = self.storage.get_cached("separate_vocals", str(input_p), input_hash, config_hash)
+    if cached is not None and Path(cached.output_path).exists():
+        meta = cached.metadata or {}
+        self.logger.info(f"Using cached vocals: {cached.output_path}")
+        return {
+            "job_id": cached.job_id, "output_path": cached.output_path,
+            "input_path": str(input_p), "duration": meta.get("duration"),
+            "model": self.config.model, "stems_available": meta.get("stems", []),
+        }
 
     # Load model (lazy, cached)
     self.report_progress(0.0, "Loading model...")
@@ -436,6 +433,7 @@ def _separate_vocals(self:DemucsProcessingPlugin,
             "device": str(self.config.device),
             "other_stems_saved": other_stems_saved,
         },
+        input_hash=input_hash, config_hash=config_hash,
     )
 
     self.report_progress(1.0, "Complete")
