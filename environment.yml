@@ -17,9 +17,12 @@ dependencies:
     # PyTorch with CUDA
     - torch
 
-    # Core plugin infrastructure
-    - cjm-plugin-system
-    - cjm-media-plugin-system
+    # Core plugin infrastructure. Stage 8 (Option C): the substrate
+    # (cjm-plugin-system) is AUTO-INJECTED by install-all schema v2 — listing it
+    # here is redundant + pre-empts --substrate-source, so it's dropped. The
+    # fused-era domain lib (cjm-media-plugin-system) dissolved on migration; the
+    # tool now depends only on the result data noun.
+    - cjm-capability-primitives
 
     # Shared torch helpers for plugins (release_model / cuda_oom / resolve_device)
     - cjm-torch-plugin-utils

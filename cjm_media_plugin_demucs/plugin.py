@@ -9,22 +9,22 @@ __all__ = ['DemucsPluginConfig', 'DemucsProcessingPlugin']
 
 # %% ../nbs/plugin.ipynb #exports-imports
 import logging
-import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, ClassVar
+from typing import Any, Dict, List, Optional, ClassVar, Union
 
 import torch
 from fastcore.basics import patch
 
-from cjm_media_plugin_system.processing_interface import MediaProcessingPlugin
-from cjm_media_plugin_system.core import MediaMetadata
-from cjm_media_plugin_system.storage import MediaProcessingStorage
-
-from cjm_plugin_system.utils.hashing import hash_file, hash_dict_canonical
-from .meta import get_plugin_metadata
-from cjm_plugin_system.utils.cache_paths import cache_dir_for_config
-from cjm_plugin_system.core.interface import RELOAD_TRIGGER, plugin_action, collect_plugin_actions, EnvVarSpec
+# Stage 8 (Option C / PILLAR 1c): the tool re-bases onto ToolCapability (pure
+# compute). The cache/persist bookends + the (input,config)->output_dir choice
+# moved OUT — the generic adapter (cjm-source-separation-adapter-interface) owns
+# the cache and tells the tool WHERE to write; the result DTO lives in
+# cjm-capability-primitives. No get_plugin_metadata, no self.storage, no in-tool
+# cache_dir_for_config. Input is FULL-BAND audio (the model-ready convert runs
+# DOWNSTREAM of separation in the transcription pipeline).
+from cjm_plugin_system.core.capability import ToolCapability, RELOAD_TRIGGER, EnvVarSpec
+from cjm_capability_primitives.source_separation import SourceSeparationResult
 from cjm_plugin_system.core.errors import PluginInputError
 from cjm_plugin_system.utils.validation import (
     dict_to_config, config_to_dict, dataclass_to_jsonschema,
@@ -105,9 +105,21 @@ class DemucsPluginConfig:
     )
 
 # %% ../nbs/plugin.ipynb #plugin-class
-class DemucsProcessingPlugin(MediaProcessingPlugin):
-    """Demucs v4 source separation plugin for vocals extraction."""
-    
+class DemucsProcessingPlugin(ToolCapability):
+    """Demucs v4 source-separation tool capability for vocals extraction (stage 8: pure compute).
+
+    Native-surface model (PILLAR 1c): this tool is PURE COMPUTE — `separate_vocals`
+    loads the model, runs separation, and WRITES the vocals stem into the
+    adapter-supplied `output_dir`, returning a typed `SourceSeparationResult`. The
+    cache-check + the output-location choice + persistence live in the generic
+    source-separation adapter (cjm-source-separation-adapter-interface); the result
+    DTO lives in cjm-capability-primitives; identity is derived from the installed
+    distribution. No `get_plugin_metadata`, no `self.storage`, no in-tool
+    `cache_dir_for_config`. Input is FULL-BAND audio (the model-ready convert runs
+    DOWNSTREAM of separation in the transcription pipeline)."""
+
+    # CR-4: declarative reload-triggers — substrate's reconfigure_with_triggers
+    # walks config_class for RELOAD_TRIGGER metadata and fires _release_<trigger>.
     config_class = DemucsPluginConfig
 
     # Track 19 (CR-12 worker-env model): worker spawn env declared on the class.
@@ -127,104 +139,47 @@ class DemucsProcessingPlugin(MediaProcessingPlugin):
             description="torch.hub cache root for Demucs model downloads (templated to the substrate models dir).",
         ),
     ]
-    
+
     def __init__(self):
         """Initialize the plugin."""
         self.logger = logging.getLogger(f"{__name__}.{type(self).__name__}")
         self.config: Optional[DemucsPluginConfig] = None
-        self.storage: Optional[MediaProcessingStorage] = None
-        self._data_dir: Optional[str] = None
         self._separator = None  # Lazy-loaded Demucs Separator
-    
+
     # ── Properties ──────────────────────────────────────────────────
-    
+
     @property
     def name(self) -> str:  # Plugin name identifier
-        """Get the plugin name."""
-        return get_plugin_metadata()["name"]
-    
+        """Plugin identity, derived from the installed distribution (PILLAR 1c)."""
+        from importlib.metadata import metadata, packages_distributions
+        dist = (packages_distributions().get(__package__) or [__package__.replace("_", "-")])[0]
+        return metadata(dist)["Name"]
+
     @property
     def version(self) -> str:  # Plugin version string
         """Get the plugin version."""
         from cjm_media_plugin_demucs import __version__
         return __version__
-    
-    @property
-    def supported_media_types(self) -> List[str]:  # Supported media types
-        """Get supported media types."""
-        return ["audio"]
-    
+
     # ── Lifecycle ────────────────────────────────────────────────────
-    
 
     def initialize(self,
                    config: Optional[Any] = None,  # Configuration dict or None for defaults
                   ) -> None:
         """First-time setup. CR-4: config application factored into _apply_config; the
         substrate's reconfigure path fires _release_model on a model/device change then
-        re-applies config."""
+        re-applies config. No storage init — the adapter owns the cache (stage 8)."""
         self._apply_config(config)
-        
-        from .meta import get_plugin_metadata
-        metadata = get_plugin_metadata()
-        db_path = metadata["db_path"]
-        self._data_dir = str(Path(db_path).parent)
-        
-        self.storage = MediaProcessingStorage(db_path)
         self.logger.info(f"Initialized with model={self.config.model}, "
                          f"device={self.config.device}")
-    
 
-
-    
-    
     def get_config_schema(self) -> Dict[str, Any]:  # JSON Schema for UI forms
         """Return JSON Schema for the plugin configuration."""
         return dataclass_to_jsonschema(DemucsPluginConfig)
-    
+
     def get_current_config(self) -> Dict[str, Any]:  # Current config as dict
         """Return the current configuration."""
         return config_to_dict(self.config) if self.config else {}
-    
-    # ── Model Management ────────────────────────────────────────────
-    
-    
-    
-    # ── Job Storage ──────────────────────────────────────────────────
-    
-    
-    # ── Action Dispatch ──────────────────────────────────────────────
-    
-    def execute(self,
-                action: str = "separate_vocals",  # Action to perform
-                **kwargs
-               ) -> Dict[str, Any]:  # Action result
-        """Dispatch to the `@plugin_action`-tagged handler for `action` (SG-44)."""
-        return self.dispatch_to_action(action, **kwargs)
-
-
-    
-    # ── Interface Methods ───────────────────────────
-    
-    def get_info(self,
-                 file_path: str,  # Path to audio file
-                ) -> MediaMetadata:  # File metadata
-        """Get basic audio file metadata via ffprobe."""
-        from demucs.audio import AudioFile
-        af = AudioFile(file_path)
-        return MediaMetadata(
-            path=file_path,
-            format=Path(file_path).suffix.lstrip('.'),
-            duration=af.duration,
-            size_bytes=Path(file_path).stat().st_size,
-            audio_streams=[{
-                'channels': af.channels(),
-                'sample_rate': af.samplerate(),
-            }],
-            video_streams=[],
-        )
-        
-    # ── Core Action ──────────────────────────────────────────────────
 
 # %% ../nbs/plugin.ipynb #m-apply-config
 @patch
@@ -305,85 +260,45 @@ def _release_model(self:DemucsProcessingPlugin) -> None:
 
 # %% ../nbs/plugin.ipynb #m-store-job
 @patch
-def _store_job(self:DemucsProcessingPlugin,
-               action: str,  # Action name
-               input_path: str,  # Source file path
-               output_path: str,  # Output file path
-               parameters: Optional[Dict[str, Any]] = None,  # Action parameters
-               metadata: Optional[Dict[str, Any]] = None,  # Additional metadata
-               input_hash: Optional[str] = None,  # Pre-computed input hash
-               config_hash: str = "",  # Cache key over the action's parameters
-              ) -> str:  # Generated job_id
-    """Hash input/output files and store a processing job record (upsert by
-    action + input_path + config_hash; logs + swallows save failures)."""
-    job_id = str(uuid.uuid4())
-    if input_hash is None:
-        input_hash = hash_file(input_path)
-    output_hash = hash_file(output_path)
-    self.storage.save_with_logging(
-        job_id=job_id, action=action,
-        input_path=input_path, input_hash=input_hash, config_hash=config_hash,
-        output_path=output_path, output_hash=output_hash,
-        parameters=parameters, metadata=metadata, logger=self.logger,
+def _prepare_audio(self:DemucsProcessingPlugin,
+                   audio: Union[str, Path]  # Path to the input audio file
+                  ) -> str:  # The audio file path
+    """Validate the audio input and return it as a path string (mirrors silero-vad).
+
+    The adapter passes a file path; decode is the demucs Separator's job."""
+    if isinstance(audio, (str, Path)):
+        return str(audio)
+    raise PluginInputError(  # SG-47: typed input-validation
+        f"Unsupported audio input type: {type(audio)}; expected a file path (str or Path)",
+        fields_invalid=["audio"],
     )
-    return job_id
-
-# %% ../nbs/plugin.ipynb #m-action-get-info
-@patch
-@plugin_action("get_info")
-def _action_get_info(self:DemucsProcessingPlugin, **kwargs) -> Dict[str, Any]:
-    """Action wrapper -> get_info()."""
-    return self.get_info(kwargs["file_path"]).to_dict()
-
-# %% ../nbs/plugin.ipynb #m-action-separate-vocals
-@patch
-@plugin_action("separate_vocals")
-def _action_separate_vocals(self:DemucsProcessingPlugin, **kwargs) -> Dict[str, Any]:
-    """Action wrapper -> _separate_vocals()."""
-    return self._separate_vocals(**kwargs)
 
 # %% ../nbs/plugin.ipynb #m-separate-vocals
 @patch
-def _separate_vocals(self:DemucsProcessingPlugin,
-                     input_path: str,  # Path to audio file
-                     output_dir: Optional[str] = None,  # Output directory (default: content+config cache dir)
-                     output_format: Optional[str] = None,  # Output format override
-                    ) -> Dict[str, Any]:  # Separation result
-    """Extract vocals stem from an audio file."""
-    fmt = output_format or self.config.output_format
-    input_p = Path(input_path)
+def separate_vocals(self:DemucsProcessingPlugin,
+                    audio: Union[str, Path],  # Path to the input audio (full-band; NOT model-ready)
+                    output_dir: str,          # Adapter-chosen dir to write the artifact into
+                    **kwargs                  # Provenance pass-through (unused by compute)
+                   ) -> SourceSeparationResult:  # Vocals-isolated artifact + metadata
+    """Extract the vocals stem from an audio file — PURE COMPUTE.
 
-    # Determine output directory. Q3 Layer B: a content+config-addressed cache dir
-    # (<data_dir>/separate_vocals/<stem>/<input6>_<config12>/) so a re-run with a
-    # different model/format lands in a DISTINCT dir instead of overwriting — and a
-    # chained upstream change invalidates this key automatically.
-    if output_dir is None:
-        out_dir = cache_dir_for_config(
-            self._data_dir, input_path, "separate_vocals", config_to_dict(self.config),
-        )
-    else:
-        out_dir = Path(output_dir)
-        out_dir.mkdir(parents=True, exist_ok=True)
-
-    # Layer C: skip the (GPU) separation if this (input, config) result is cached.
-    input_hash = hash_file(input_path)
-    config_hash = hash_dict_canonical(config_to_dict(self.config))
-    cached = self.storage.get_cached("separate_vocals", str(input_p), input_hash, config_hash)
-    if cached is not None and Path(cached.output_path).exists():
-        meta = cached.metadata or {}
-        self.logger.info(f"Using cached vocals: {cached.output_path}")
-        return {
-            "job_id": cached.job_id, "output_path": cached.output_path,
-            "input_path": str(input_p), "duration": meta.get("duration"),
-            "model": self.config.model, "stems_available": meta.get("stems", []),
-        }
+    Stage 8 / PILLAR 1c: the cache-check + the (input,config)->output_dir choice +
+    persistence moved to the generic adapter (cjm-source-separation-adapter-interface);
+    this method loads the model, runs separation, WRITES the vocals stem (+ optional
+    other stems) into the adapter-supplied `output_dir`, and returns the typed
+    result. Separation params come from `self.config` (no per-call kwarg override —
+    the tool runs its effective config). SG-47 Track B maps a CUDA OOM at the
+    inference site to PluginResourceError (CR-7 reactive-retry reloads)."""
+    input_p = Path(self._prepare_audio(audio))
+    fmt = self.config.output_format
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     # Load model (lazy, cached)
     self.report_progress(0.0, "Loading model...")
     self._load_model()
 
-    # Run separation. SG-47 Track B wraps the inference site so CUDA OOM surfaces as
-    # PluginResourceError (via cjm-torch-plugin-utils) → CR-7 reactive-retry reloads.
+    # Run separation.
     self.report_progress(0.1, "Separating audio...")
     try:
         origin, separated = self._separator.separate_audio_file(input_p)
@@ -392,14 +307,14 @@ def _separate_vocals(self:DemucsProcessingPlugin,
             e, label=f"during Demucs separation (model={self.config.model!r})",
         ) from e
 
-    # Save vocals
+    # Save vocals into the adapter-supplied dir.
     self.report_progress(0.8, "Saving vocals...")
     from demucs.audio import save_audio
     vocals_path = out_dir / f"vocals.{fmt}"
     save_audio(separated["vocals"], str(vocals_path),
                samplerate=self._separator.samplerate)
 
-    # Optionally save other stems
+    # Optionally save other stems alongside.
     other_stems_saved = []
     if self.config.save_other_stems:
         for stem_name, stem_tensor in separated.items():
@@ -410,37 +325,16 @@ def _separate_vocals(self:DemucsProcessingPlugin,
                        samplerate=self._separator.samplerate)
             other_stems_saved.append(str(stem_path))
 
-    # Hash and store job
-    self.report_progress(0.9, "Storing job record...")
-    job_id = self._store_job(
-        action="separate_vocals",
-        input_path=str(input_p),
-        output_path=str(vocals_path),
-        parameters={
-            "model": self.config.model,
-            "output_format": fmt,
-            "shifts": self.config.shifts,
-            "overlap": self.config.overlap,
-        },
-        metadata={
-            "duration": float(separated["vocals"].shape[-1]) / self._separator.samplerate,
-            "stems": list(separated.keys()),
-            "device": str(self.config.device),
-            "other_stems_saved": other_stems_saved,
-        },
-        input_hash=input_hash, config_hash=config_hash,
-    )
-
     self.report_progress(1.0, "Complete")
-
-    return {
-        "job_id": job_id,
-        "output_path": str(vocals_path),
-        "input_path": str(input_p),
-        "duration": float(separated["vocals"].shape[-1]) / self._separator.samplerate,
-        "model": self.config.model,
-        "stems_available": list(separated.keys()),
-    }
-
-# %% ../nbs/plugin.ipynb #plugin-class-tail
-DemucsProcessingPlugin.supported_actions = collect_plugin_actions(DemucsProcessingPlugin)
+    return SourceSeparationResult(
+        output_path=str(vocals_path),
+        metadata={
+            "input_path": str(input_p),
+            "duration": float(separated["vocals"].shape[-1]) / self._separator.samplerate,
+            "sample_rate": self._separator.samplerate,
+            "model": self.config.model,
+            "stems_available": list(separated.keys()),
+            "other_stems_saved": other_stems_saved,
+            "device": str(self.config.device),
+        },
+    )
