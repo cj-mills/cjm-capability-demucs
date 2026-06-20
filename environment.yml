@@ -1,6 +1,6 @@
-# Environment for cjm-media-plugin-demucs
+# Environment for cjm-media-capability-demucs
 # Provides Demucs v4 source separation with PyTorch CUDA support
-name: cjm-media-plugin-demucs
+name: cjm-capability-demucs
 channels:
   - conda-forge
   - defaults
@@ -17,15 +17,15 @@ dependencies:
     # PyTorch with CUDA
     - torch
 
-    # Core plugin infrastructure. Stage 8 (Option C): the substrate
-    # (cjm-plugin-system) is AUTO-INJECTED by install-all schema v2 — listing it
+    # Core capability infrastructure. Stage 8 (Option C): the substrate
+    # (cjm-substrate) is AUTO-INJECTED by install-all schema v2 — listing it
     # here is redundant + pre-empts --substrate-source, so it's dropped. The
-    # fused-era domain lib (cjm-media-plugin-system) dissolved on migration; the
+    # fused-era domain lib (cjm-media-capability-system) dissolved on migration; the
     # tool now depends only on the result data noun.
     - cjm-capability-primitives
 
-    # Shared torch helpers for plugins (release_model / cuda_oom / resolve_device)
-    - cjm-torch-plugin-utils
+    # Shared torch helpers for capabilitys (release_model / cuda_oom / resolve_device)
+    - cjm-substrate-torch-utils
 
     # Demucs fork (inference-only, TorchCodec)
     - cjm-demucs-v4

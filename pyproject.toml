@@ -3,28 +3,28 @@ requires = ["setuptools>=64"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "cjm-media-plugin-demucs"
+name = "cjm-capability-demucs"
 dynamic = ["version"]
-description = "Demucs v4 audio source separation plugin for the cjm-plugin-system that provides vocals extraction for removing background noise and music from speech audio."
+description = "A Demucs v4 source-separation capability for the cjm-substrate runtime that extracts vocals to remove background noise and music from speech audio."
 readme = "README.md"
 requires-python = ">=3.12"
 license = {text = "Apache-2.0"}
 authors = [{name = "Christian J. Mills", email = "9126128+cj-mills@users.noreply.github.com"}]
 keywords = ['nbdev', 'jupyter', 'notebook', 'python']
 classifiers = ["Natural Language :: English", "Intended Audience :: Developers", "Development Status :: 3 - Alpha", "Programming Language :: Python :: 3", "Programming Language :: Python :: 3 :: Only"]
-dependencies = ['cjm_plugin_system>=0.0.46', 'cjm_capability_primitives>=0.0.8', 'cjm-demucs-v4', 'cjm-torch-plugin-utils>=0.0.10']
+dependencies = ['cjm-substrate>=0.0.50', 'cjm-capability-primitives>=0.0.9', 'cjm-demucs-v4', 'cjm-substrate-torch-utils>=0.0.11']
 
 [project.urls]
-Repository = "https://github.com/cj-mills/cjm-media-plugin-demucs"
-Documentation = "https://cj-mills.github.io/cjm-media-plugin-demucs"
+Repository = "https://github.com/cj-mills/cjm-capability-demucs"
+Documentation = "https://cj-mills.github.io/cjm-capability-demucs"
 
 [project.entry-points.nbdev]
-cjm_media_plugin_demucs = "cjm_media_plugin_demucs._modidx:d"
+cjm_capability_demucs = "cjm_capability_demucs._modidx:d"
 
 [tool.setuptools.dynamic]
-version = {attr = "cjm_media_plugin_demucs.__version__"}
+version = {attr = "cjm_capability_demucs.__version__"}
 
 [tool.setuptools.packages.find]
-include = ["cjm_media_plugin_demucs*"]
+include = ["cjm_capability_demucs*"]
 
 [tool.nbdev]
