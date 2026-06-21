@@ -1,0 +1,82 @@
+[
+  {
+    "objectID": "index.html",
+    "href": "index.html",
+    "title": "cjm-capability-demucs",
+    "section": "",
+    "text": "pip install cjm_capability_demucs",
+    "crumbs": [
+      "cjm-capability-demucs"
+    ]
+  },
+  {
+    "objectID": "index.html#install",
+    "href": "index.html#install",
+    "title": "cjm-capability-demucs",
+    "section": "",
+    "text": "pip install cjm_capability_demucs",
+    "crumbs": [
+      "cjm-capability-demucs"
+    ]
+  },
+  {
+    "objectID": "index.html#project-structure",
+    "href": "index.html#project-structure",
+    "title": "cjm-capability-demucs",
+    "section": "Project Structure",
+    "text": "Project Structure\nnbs/\n└── capability.ipynb # Demucs v4 audio source separation capability — provides vocals extraction for removing background noise and music from speech audio.\nTotal: 1 notebook",
+    "crumbs": [
+      "cjm-capability-demucs"
+    ]
+  },
+  {
+    "objectID": "index.html#module-dependencies",
+    "href": "index.html#module-dependencies",
+    "title": "cjm-capability-demucs",
+    "section": "Module Dependencies",
+    "text": "Module Dependencies\ngraph LR\n    capability[\"capability&lt;br/&gt;Capability\"]\n\nNo cross-module dependencies detected.",
+    "crumbs": [
+      "cjm-capability-demucs"
+    ]
+  },
+  {
+    "objectID": "index.html#cli-reference",
+    "href": "index.html#cli-reference",
+    "title": "cjm-capability-demucs",
+    "section": "CLI Reference",
+    "text": "CLI Reference\nNo CLI commands found in this project.",
+    "crumbs": [
+      "cjm-capability-demucs"
+    ]
+  },
+  {
+    "objectID": "index.html#module-overview",
+    "href": "index.html#module-overview",
+    "title": "cjm-capability-demucs",
+    "section": "Module Overview",
+    "text": "Module Overview\nDetailed documentation for each module in the project:\n\nCapability (capability.ipynb)\n\nDemucs v4 audio source separation capability — provides vocals extraction for removing background noise and music from speech audio.\n\n\nImport\nfrom cjm_capability_demucs.capability import (\n    DemucsCapabilityConfig,\n    DemucsProcessingCapability\n)\n\n\nFunctions\n@patch\ndef _apply_config(self:DemucsProcessingCapability,\n                  config: Optional[Any] = None,  # Configuration dict or None for defaults\n                 ) -&gt; None\n    \"\"\"\n    CR-4: apply config values only. Called by initialize (first-time) and the\n    substrate's reconfigure delta path. Model release on a model/device change is\n    handled declaratively via RELOAD_TRIGGER -&gt; _release_model (device resolved\n    lazily in _load_model).\n    \"\"\"\n@patch\ndef prefetch(self:DemucsProcessingCapability) -&gt; None\n    \"\"\"\n    CR-4 (SG-19): eagerly load the model so the first execute() doesn't pay\n    the download/load cost. Idempotent via _load_model's None-guard.\n    \"\"\"\n@patch\ndef on_disable(self:DemucsProcessingCapability) -&gt; None\n    \"\"\"\n    CR-2: release the GPU model when the operator disables the capability (the\n    worker stays alive); lazy reload on the next execute after re-enable.\n    \"\"\"\n@patch\ndef cleanup(self:DemucsProcessingCapability) -&gt; None\n    \"Clean up capability resources.\"\n@patch\ndef is_available(self:DemucsProcessingCapability) -&gt; bool:  # Whether the capability can run\n    \"\"\"Check if the capability is available on this system.\"\"\"\n    try\n    \"Check if the capability is available on this system.\"\n@patch\ndef _load_model(self:DemucsProcessingCapability) -&gt; None:\n    \"\"\"Load the Demucs Separator (lazy, cached).\n\n    CR-4: a model/device change releases the separator declaratively via\n    RELOAD_TRIGGER -&gt; _release_model, so no manual change-detection is needed here —\n    a None separator means a (re)load is required. The heartbeat wraps the WHOLE\n    load: Separator() downloads weights via torch.hub on a cold cache (silent to the\n    substrate's stall detector), so the heartbeat keeps the (progress, message)\n    tuple advancing to avoid a false-positive stall.\"\"\"\n    if self._separator is not None\n    \"\"\"\n    Load the Demucs Separator (lazy, cached).\n    \n    CR-4: a model/device change releases the separator declaratively via\n    RELOAD_TRIGGER -&gt; _release_model, so no manual change-detection is needed here —\n    a None separator means a (re)load is required. The heartbeat wraps the WHOLE\n    load: Separator() downloads weights via torch.hub on a cold cache (silent to the\n    substrate's stall detector), so the heartbeat keeps the (progress, message)\n    tuple advancing to avoid a false-positive stall.\n    \"\"\"\n@patch\ndef _release_model(self:DemucsProcessingCapability) -&gt; None\n    \"\"\"\n    CR-4: release the Demucs Separator + free CUDA cache. RELOAD_TRIGGER target\n    for model/device; on_disable / cleanup delegate here. Idempotent via\n    cjm-substrate-torch-utils' release_model (no-op when already released).\n    \"\"\"\n@patch\ndef _prepare_audio(self:DemucsProcessingCapability,\n                   audio: Union[str, Path]  # Path to the input audio file\n                  ) -&gt; str:  # The audio file path\n    \"\"\"\n    Validate the audio input and return it as a path string (mirrors silero-vad).\n    \n    The adapter passes a file path; decode is the demucs Separator's job.\n    \"\"\"\n@patch\ndef separate_vocals(self:DemucsProcessingCapability,\n                    audio: Union[str, Path],  # Path to the input audio (full-band; NOT model-ready)\n                    output_dir: str,          # Adapter-chosen dir to write the artifact into\n                    **kwargs                  # Provenance pass-through (unused by compute)\n                   ) -&gt; SourceSeparationResult:  # Vocals-isolated artifact + metadata\n    \"\"\"\n    Extract the vocals stem from an audio file — PURE COMPUTE.\n    \n    Stage 8 / PILLAR 1c: the cache-check + the (input,config)-&gt;output_dir choice +\n    persistence moved to the generic adapter (cjm-source-separation-adapter-interface);\n    this method loads the model, runs separation, WRITES the vocals stem (+ optional\n    other stems) into the adapter-supplied `output_dir`, and returns the typed\n    result. Separation params come from `self.config` (no per-call kwarg override —\n    the tool runs its effective config). SG-47 Track B maps a CUDA OOM at the\n    inference site to CapabilityResourceError (CR-7 reactive-retry reloads).\n    \"\"\"\n\n\nClasses\n@dataclass\nclass DemucsCapabilityConfig:\n    \"Configuration for the Demucs processing capability.\"\n    \n    model: str = field(...)\n    device: str = field(...)\n    shifts: int = field(...)\n    overlap: float = field(...)\n    segment: Optional[int] = field(...)\n    save_other_stems: bool = field(...)\n    output_format: str = field(...)\nclass DemucsProcessingCapability:\n    def __init__(self):\n        \"\"\"Initialize the capability.\"\"\"\n        self.logger = logging.getLogger(f\"{__name__}.{type(self).__name__}\")\n        self.config: Optional[DemucsCapabilityConfig] = None\n    \"\"\"\n    Demucs v4 source-separation tool capability for vocals extraction (stage 8: pure compute).\n    \n    Native-surface model (PILLAR 1c): this tool is PURE COMPUTE — `separate_vocals`\n    loads the model, runs separation, and WRITES the vocals stem into the\n    adapter-supplied `output_dir`, returning a typed `SourceSeparationResult`. The\n    cache-check + the output-location choice + persistence live in the generic\n    source-separation adapter (cjm-source-separation-adapter-interface); the result\n    DTO lives in cjm-capability-primitives; identity is derived from the installed\n    distribution. No `get_plugin_metadata`, no `self.storage`, no in-tool\n    `cache_dir_for_config`. Input is FULL-BAND audio (the model-ready convert runs\n    DOWNSTREAM of separation in the transcription pipeline).\n    \"\"\"\n    \n    def __init__(self):\n            \"\"\"Initialize the capability.\"\"\"\n            self.logger = logging.getLogger(f\"{__name__}.{type(self).__name__}\")\n            self.config: Optional[DemucsCapabilityConfig] = None\n        \"Initialize the capability.\"\n    \n    def name(self) -&gt; str:  # Capability name identifier\n            \"\"\"Capability identity, derived from the installed distribution (PILLAR 1c).\"\"\"\n            from importlib.metadata import metadata, packages_distributions\n            dist = (packages_distributions().get(__package__) or [__package__.replace(\"_\", \"-\")])[0]\n            return metadata(dist)[\"Name\"]\n    \n        @property\n        def version(self) -&gt; str:  # Capability version string\n        \"Capability identity, derived from the installed distribution (PILLAR 1c).\"\n    \n    def version(self) -&gt; str:  # Capability version string\n            \"\"\"Get the capability version.\"\"\"\n            from cjm_capability_demucs import __version__\n            return __version__\n    \n        # ── Lifecycle ────────────────────────────────────────────────────\n    \n        def initialize(self,\n                       config: Optional[Any] = None,  # Configuration dict or None for defaults\n                      ) -&gt; None\n        \"Get the capability version.\"\n    \n    def initialize(self,\n                       config: Optional[Any] = None,  # Configuration dict or None for defaults\n                      ) -&gt; None\n        \"First-time setup. CR-4: config application factored into _apply_config; the\nsubstrate's reconfigure path fires _release_model on a model/device change then\nre-applies config. No storage init — the adapter owns the cache (stage 8).\"\n    \n    def get_config_schema(self) -&gt; Dict[str, Any]:  # JSON Schema for UI forms\n            \"\"\"Return JSON Schema for the capability configuration.\"\"\"\n            return dataclass_to_jsonschema(DemucsCapabilityConfig)\n    \n        def get_current_config(self) -&gt; Dict[str, Any]:  # Current config as dict\n        \"Return JSON Schema for the capability configuration.\"\n    \n    def get_current_config(self) -&gt; Dict[str, Any]:  # Current config as dict\n        \"Return the current configuration.\"",
+    "crumbs": [
+      "cjm-capability-demucs"
+    ]
+  },
+  {
+    "objectID": "capability.html#configuration",
+    "href": "capability.html#configuration",
+    "title": "Capability",
+    "section": "Configuration",
+    "text": "Configuration\n\n\nDemucsCapabilityConfig\n\ndef DemucsCapabilityConfig(\n    model:str='htdemucs', device:str='auto', shifts:int=1, overlap:float=0.25, segment:Optional=None,\n    save_other_stems:bool=False, output_format:str='wav'\n)-&gt;None:\n\nConfiguration for the Demucs processing capability.",
+    "crumbs": [
+      "Capability"
+    ]
+  },
+  {
+    "objectID": "capability.html#capability-class",
+    "href": "capability.html#capability-class",
+    "title": "Capability",
+    "section": "Capability Class",
+    "text": "Capability Class\n\n\nDemucsProcessingCapability\n\ndef DemucsProcessingCapability(\n    \n):\n\nDemucs v4 source-separation tool capability for vocals extraction (stage 8: pure compute).\nNative-surface model (PILLAR 1c): this tool is PURE COMPUTE — separate_vocals loads the model, runs separation, and WRITES the vocals stem into the adapter-supplied output_dir, returning a typed SourceSeparationResult. The cache-check + the output-location choice + persistence live in the generic source-separation adapter (cjm-source-separation-adapter-interface); the result DTO lives in cjm-capability-primitives; identity is derived from the installed distribution. No get_plugin_metadata, no self.storage, no in-tool cache_dir_for_config. Input is FULL-BAND audio (the model-ready convert runs DOWNSTREAM of separation in the transcription pipeline).\n\n\n\nDemucsProcessingCapability.prefetch\n\ndef prefetch(\n    \n)-&gt;None:\n\nCR-4 (SG-19): eagerly load the model so the first execute() doesn’t pay the download/load cost. Idempotent via _load_model’s None-guard.\n\n\n\nDemucsProcessingCapability.on_disable\n\ndef on_disable(\n    \n)-&gt;None:\n\nCR-2: release the GPU model when the operator disables the capability (the worker stays alive); lazy reload on the next execute after re-enable.\n\n\n\nDemucsProcessingCapability.cleanup\n\ndef cleanup(\n    \n)-&gt;None:\n\nClean up capability resources.\n\n\n\nDemucsProcessingCapability.is_available\n\ndef is_available(\n    \n)-&gt;bool: # Whether the capability can run\n\nCheck if the capability is available on this system.\n\n\n\nDemucsProcessingCapability.separate_vocals\n\ndef separate_vocals(\n    audio:Union, # Path to the input audio (full-band; NOT model-ready)\n    output_dir:str, # Adapter-chosen dir to write the artifact into\n    kwargs:VAR_KEYWORD\n)-&gt;SourceSeparationResult: # Vocals-isolated artifact + metadata\n\nExtract the vocals stem from an audio file — PURE COMPUTE.\nStage 8 / PILLAR 1c: the cache-check + the (input,config)-&gt;output_dir choice + persistence moved to the generic adapter (cjm-source-separation-adapter-interface); this method loads the model, runs separation, WRITES the vocals stem (+ optional other stems) into the adapter-supplied output_dir, and returns the typed result. Separation params come from self.config (no per-call kwarg override — the tool runs its effective config). SG-47 Track B maps a CUDA OOM at the inference site to CapabilityResourceError (CR-7 reactive-retry reloads).",
+    "crumbs": [
+      "Capability"
+    ]
+  }
+]
