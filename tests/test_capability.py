@@ -41,3 +41,28 @@ def test_reload_trigger_metadata():
     triggers = {f.name: f.metadata.get(RELOAD_TRIGGER) for f in fields(DemucsCapabilityConfig)}
     # model + device changes must fire the model release (CR-4 declarative path)
     assert triggers["model"] == "model" and triggers["device"] == "model"
+
+
+def test_zero_sample_decode_is_an_input_error_naming_the_file(tmp_path):
+    # Sighted 2026-09-10: a stream-copied Ogg/Opus cut with negative granule positions
+    # decoded to ZERO samples and demucs died on a bare `assert offset < total_length`
+    # — a message-less AssertionError that reached the host as CapabilityFatalError('').
+    # The capability names the input instead: the file's fault, typed as user_input.
+    import pytest
+    from cjm_substrate.core.errors import CapabilityInputError
+
+    class _Sep:
+        samplerate = 44100
+
+        def separate_audio_file(self, p):
+            assert 0 < 0   # the shape of demucs.apply.TensorChunk's guard on an empty mix
+
+    cap = DemucsProcessingCapability()
+    cap._apply_config({})
+    cap._separator = _Sep()
+    src = tmp_path / "cut.ogg"
+    src.write_bytes(b"OggS")
+    with pytest.raises(CapabilityInputError) as ei:
+        cap.separate_vocals(src, str(tmp_path / "out"))
+    assert "cut.ogg" in str(ei.value) and "AssertionError" in str(ei.value)
+    assert ei.value.fields_invalid == ["audio"]

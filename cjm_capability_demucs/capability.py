@@ -270,6 +270,17 @@ class DemucsProcessingCapability(ToolCapability):
         self.report_progress(0.1, "Separating audio...")
         try:
             origin, separated = self._separator.separate_audio_file(input_p)
+        except AssertionError as e:
+            # demucs asserts (bare, message-less) deep in apply_model when the decode
+            # yielded ZERO samples — sighted 2026-09-10 on a stream-copied Ogg/Opus cut
+            # whose negative granule positions ffmpeg refused to decode while ffprobe
+            # still reported the duration. Name the input: an empty decode is the
+            # FILE's fault, not the model's, and a blank fatal error is undiagnosable.
+            raise CapabilityInputError(  # SG-47: typed input-validation
+                f"Demucs decoded no usable audio from {input_p} (a damaged, empty or "
+                f"unreadable file?) — {type(e).__name__} inside demucs: {e!r}",
+                fields_invalid=["audio"],
+            ) from e
         except Exception as e:
             # is_cuda_oom: caching-allocator subclass OR driver-level RuntimeError OOM;
             # non-OOM errors propagate unchanged for the substrate's classifier.
