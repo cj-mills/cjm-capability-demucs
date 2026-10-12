@@ -26,7 +26,7 @@ from cjm_substrate_torch_utils.oom import cuda_oom_to_capability_resource_error,
 @dataclass
 class DemucsCapabilityConfig:
     """Configuration for the Demucs processing capability."""
-    
+
     model: str = field(
         default="htdemucs",
         metadata={
@@ -36,7 +36,7 @@ class DemucsCapabilityConfig:
             SCHEMA_ENUM: ["htdemucs", "htdemucs_ft", "htdemucs_6s", "mdx_extra", "mdx_extra_q"]
         }
     )
-    
+
     device: str = field(
         default="auto",
         metadata={
@@ -46,7 +46,7 @@ class DemucsCapabilityConfig:
             SCHEMA_ENUM: ["auto", "cpu", "cuda"]
         }
     )
-    
+
     shifts: int = field(
         default=1,
         metadata={
@@ -55,7 +55,7 @@ class DemucsCapabilityConfig:
             SCHEMA_MIN: 0, SCHEMA_MAX: 10
         }
     )
-    
+
     overlap: float = field(
         default=0.25,
         metadata={
@@ -64,7 +64,7 @@ class DemucsCapabilityConfig:
             SCHEMA_MIN: 0.0, SCHEMA_MAX: 0.5
         }
     )
-    
+
     segment: Optional[int] = field(
         default=None,
         metadata={
@@ -72,7 +72,7 @@ class DemucsCapabilityConfig:
             SCHEMA_DESC: "Split audio into segments of this many seconds for processing. None = process whole file."
         }
     )
-    
+
     save_other_stems: bool = field(
         default=False,
         metadata={
@@ -80,7 +80,7 @@ class DemucsCapabilityConfig:
             SCHEMA_DESC: "Also save drums, bass, and other stems alongside vocals."
         }
     )
-    
+
     output_format: str = field(
         default="wav",
         metadata={
