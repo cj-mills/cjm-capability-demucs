@@ -4,8 +4,8 @@ The notebook carried no test cells; these cover the pure-compute surface that
 runs without the Demucs model: config round-trip/schema, capability shape,
 declarative reload triggers, and lazy-load state. Real separation is exercised
 by the transcription pipeline's live runs."""
-from cjm_capability_demucs.capability import (DemucsCapabilityConfig,
-                                              DemucsProcessingCapability)
+
+from cjm_capability_demucs.capability import DemucsCapabilityConfig, DemucsProcessingCapability
 from cjm_substrate.utils.validation import config_to_dict, dict_to_config
 
 
