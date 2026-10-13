@@ -6,6 +6,7 @@ A Demucs v4 source-separation capability for the cjm-substrate runtime that extr
 
 ## Modules
 
+- **`cjm_capability_demucs.__init__`**
 - **`cjm_capability_demucs.capability`** — Demucs v4 audio source separation capability — provides vocals extraction for removing background noise and music from speech audio.
 
 ## API
